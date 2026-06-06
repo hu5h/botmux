@@ -2837,30 +2837,37 @@ async function relaySend(rest: string[], relayDir: string): Promise<void> {
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
   const id = randomBytes(8).toString('hex');
-  const cfile = join(relayDir, `${id}.content`);
+  // Structured request: the daemon-side watcher rebuilds the argv from these
+  // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
+  // Content + attachments are written into the shared outbox as plain
+  // basenames; the watcher validates they stay inside the outbox, allowlists
+  // the flags, and forces the session-id. This is what keeps creds out of the
+  // sandbox: the sandbox can't make the host read an arbitrary path.
+  const contentBase = `${id}.content`;
+  const cfile = join(relayDir, contentBase);
   writeFileSync(cfile, content);
-  // Forward flags verbatim, but: replace any --content-file with our shared
-  // one, pin --session-id (ancestor-pid inference doesn't cross the sandbox),
-  // and copy any --image/--file attachment into the shared outbox + rewrite its
-  // path (the in-sandbox path won't resolve on the host side, which delivers).
-  const FILE_FLAGS = new Set(['--image', '--images', '--file', '--files']);
-  const copyIntoOutbox = (p: string): string => {
-    if (!p || !existsSync(p)) return p;  // let the host side surface a clear error
-    const dst = join(relayDir, `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`);
-    try { writeFileSync(dst, readFileSync(p)); return dst; } catch { return p; }
-  };
-  const hostArgs: string[] = [];
+
+  // Copy any --image/--file attachment into the outbox; carry only basenames.
+  const attachments: string[] = [];
+  for (const p of argValues(rest, '--image', '--images', '--file', '--files')) {
+    if (!p || !existsSync(p)) continue;
+    const base = `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`;
+    try { writeFileSync(join(relayDir, base), readFileSync(p)); attachments.push(base); } catch { /* skip unreadable */ }
+  }
+
+  // Forward only presentation flags (must match the watcher's allowlist); path,
+  // routing (--chat-id/--into/--top-level) and --session-id flags are dropped —
+  // content/attachments come from the outbox and session-id is forced host-side.
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
+  const FLAGS_VAL = new Set(['--mention', '--quote']);
+  const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
-    if (tok === '--content-file') { i++; continue; }
-    if (tok === '--session-id') { i++; continue; }
-    if (FILE_FLAGS.has(tok) && i + 1 < rest.length) { hostArgs.push(tok, copyIntoOutbox(rest[++i])); continue; }
-    const eqFlag = [...FILE_FLAGS].find(f => tok.startsWith(f + '='));
-    if (eqFlag) { hostArgs.push(`${eqFlag}=${copyIntoOutbox(tok.slice(eqFlag.length + 1))}`); continue; }
-    hostArgs.push(tok);
+    if (FLAGS_NOVAL.has(tok)) flags.push(tok);
+    else if (FLAGS_VAL.has(tok) && i + 1 < rest.length) flags.push(tok, rest[++i]);
+    // else dropped
   }
-  hostArgs.push('--content-file', cfile, '--session-id', sid);
-  writeFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ hostArgs }));
+  writeFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ contentFile: contentBase, attachments, flags }));
 
   const resPath = join(relayDir, `${id}.res.json`);
   const deadlineMs = Date.now() + 120_000;

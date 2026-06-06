@@ -3327,9 +3327,11 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   let spawnBin = cliAdapter.resolvedBin;
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
-  if ((cfg.sandbox || sandboxEnabled()) && effectiveBackendType === 'pty' && process.env.SESSION_DATA_DIR) {
+  const sandboxOn = cfg.sandbox === true || sandboxEnabled();
+  if (sandboxOn && effectiveBackendType === 'pty' && process.env.SESSION_DATA_DIR) {
     try {
       const sbx = prepareSandbox({
+        enabled: sandboxOn,
         cliId: cfg.cliId,
         sessionId: cfg.sessionId,
         sourceWorkingDir: cfg.workingDir,
@@ -3343,7 +3345,8 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
         spawnCwd = sbx.workDir;
         Object.assign(childEnv, sbx.env);
         if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv);
+        // session-id is FORCED here so a relayed send can't target another session.
+        sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv, cfg.sessionId);
         log(`Sandbox ON (${cfg.cliId}): work=${sbx.workDir} outbox=${sbx.outbox}`);
       }
     } catch (err: any) {

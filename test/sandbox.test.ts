@@ -8,8 +8,10 @@
 import { describe, it, expect } from 'vitest';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync } from 'node:fs';
-import { buildSandboxArgs, seedScopedConfig, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { mkdtempSync, existsSync, writeFileSync, symlinkSync } from 'node:fs';
+import { buildSandboxArgs, seedScopedConfig, buildRelayHostArgs, prepareSandbox, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+
+const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
 function plan(over: Partial<SandboxPlan> = {}): SandboxPlan {
   return {
@@ -76,5 +78,97 @@ describe('seedScopedConfig', () => {
     expect(seedScopedConfig('codex', home)).toBe(true);
     // The de-identified ~/.codex is materialised even if the host has nothing to copy.
     expect(existsSync(join(home, '.codex'))).toBe(true);
+  });
+});
+
+// ── buildRelayHostArgs: the security boundary for the outbox send relay ──────
+// Regression for the "sandbox makes host read an arbitrary path" confused-deputy
+// blocker: the watcher must NEVER honor raw argv or paths outside the outbox.
+describe('buildRelayHostArgs', () => {
+  const SID = 'sess-123';
+
+  it('accepts an outbox-resident content file + attachment + allowlisted flags, and forces session-id', () => {
+    const outbox = tmp();
+    writeFileSync(join(outbox, 'c.content'), 'hi');
+    writeFileSync(join(outbox, 'a.png'), 'png');
+    const r = buildRelayHostArgs(
+      { contentFile: 'c.content', attachments: ['a.png'], flags: ['--mention-back', '--mention', 'ou:X'] },
+      outbox, SID,
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.hostArgs).toContain('--mention-back');
+    expect(r.hostArgs).toEqual(expect.arrayContaining(['--mention', 'ou:X']));
+    expect(r.hostArgs).toEqual(expect.arrayContaining(['--content-file', join(outbox, 'c.content')]));
+    expect(r.hostArgs).toEqual(expect.arrayContaining(['--files', join(outbox, 'a.png')]));
+    // session-id is FORCED to the worker's value, last
+    expect(r.hostArgs.slice(-2)).toEqual(['--session-id', SID]);
+  });
+
+  it('rejects the raw-hostArgs exploit (path-bearing flag is not allowlisted)', () => {
+    const outbox = tmp();
+    writeFileSync(join(outbox, 'c.content'), 'x');
+    // the old exploit: try to make the host read bots.json
+    const r = buildRelayHostArgs(
+      { contentFile: 'c.content', flags: ['--content-file', '/root/.botmux/bots.json'] },
+      outbox, SID,
+    );
+    expect(r.ok).toBe(false);
+  });
+
+  it('rejects a sandbox-supplied --session-id (cannot target another session)', () => {
+    const outbox = tmp();
+    writeFileSync(join(outbox, 'c.content'), 'x');
+    const r = buildRelayHostArgs({ contentFile: 'c.content', flags: ['--session-id', 'other'] }, outbox, SID);
+    expect(r.ok).toBe(false);
+  });
+
+  it('rejects contentFile / attachment paths that escape the outbox', () => {
+    const outbox = tmp();
+    writeFileSync(join(outbox, 'c.content'), 'x');
+    expect(buildRelayHostArgs({ contentFile: '../../etc/passwd' }, outbox, SID).ok).toBe(false);
+    expect(buildRelayHostArgs({ contentFile: 'c.content', attachments: ['../secret'] }, outbox, SID).ok).toBe(false);
+    expect(buildRelayHostArgs({ contentFile: 'missing' }, outbox, SID).ok).toBe(false);
+  });
+
+  it('rejects a symlink inside the outbox that points outside it', () => {
+    const outbox = tmp();
+    const secretDir = tmp();
+    const secret = join(secretDir, 'secret');
+    writeFileSync(secret, 'TOP SECRET');
+    symlinkSync(secret, join(outbox, 'link.content'));  // sandbox can create symlinks in the bound outbox
+    const r = buildRelayHostArgs({ contentFile: 'link.content' }, outbox, SID);
+    expect(r.ok).toBe(false);
+  });
+});
+
+// ── prepareSandbox: the per-bot toggle must actually engage bwrap ────────────
+// Regression for the "dashboard sandbox:true never triggers bwrap" blocker:
+// prepareSandbox must honor the explicit `enabled` flag, NOT the env var.
+describe('prepareSandbox enabled gate', () => {
+  it('returns null when not enabled (regardless of env)', () => {
+    const r = prepareSandbox({
+      enabled: false, cliId: 'codex', sessionId: 's', sourceWorkingDir: tmp(),
+      dataDir: tmp(), cliBin: '/bin/true', cliArgs: [],
+    });
+    expect(r).toBeNull();
+  });
+
+  it.skipIf(process.platform !== 'linux')('engages bwrap when enabled=true without BOTMUX_SANDBOX env', () => {
+    const src = tmp();
+    writeFileSync(join(src, 'file.txt'), 'x');  // a non-git project copied via cp
+    const prev = process.env.BOTMUX_SANDBOX;
+    delete process.env.BOTMUX_SANDBOX;  // prove env is NOT what enables it
+    try {
+      const r = prepareSandbox({
+        enabled: true, cliId: 'codex', sessionId: 'pb', sourceWorkingDir: src,
+        dataDir: tmp(), cliBin: '/bin/true', cliArgs: [],
+      });
+      expect(r).not.toBeNull();
+      expect(r!.bin).toBe('bwrap');
+      expect(r!.args).toContain('--');
+    } finally {
+      if (prev !== undefined) process.env.BOTMUX_SANDBOX = prev;
+    }
   });
 });

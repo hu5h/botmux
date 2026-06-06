@@ -179,6 +179,10 @@ function cloneProject(src: string, dst: string): void {
  * de-identified config dir, and installs a `botmux` shim on PATH.
  */
 export function prepareSandbox(opts: {
+  /** Whether the sandbox is on for THIS session (per-bot BotConfig.sandbox OR
+   *  the BOTMUX_SANDBOX env force). Decided by the caller — prepareSandbox does
+   *  NOT re-read the env, so the dashboard per-bot toggle actually takes effect. */
+  enabled: boolean;
   cliId: string;
   sessionId: string;
   sourceWorkingDir: string;
@@ -186,7 +190,7 @@ export function prepareSandbox(opts: {
   cliBin: string;
   cliArgs: string[];
 }): SandboxSpawn | null {
-  if (!sandboxEnabled()) return null;
+  if (!opts.enabled) return null;
   if (process.platform !== 'linux') return null; // bwrap is Linux-only
 
   const root = join(opts.dataDir, 'sandboxes', opts.sessionId);
@@ -250,20 +254,104 @@ export function prepareSandbox(opts: {
   };
 }
 
+// Relay request schema (written by cli.ts relaySend, validated here). The
+// watcher NEVER executes sandbox-supplied argv — it rebuilds the command from
+// these validated fields. This is the security boundary: a malicious agent can
+// write any outbox file, so everything here is treated as untrusted.
+//   { contentFile: <basename in outbox>, attachments: [<basename>...], flags: [...] }
+export interface RelayRequest {
+  contentFile?: unknown;
+  attachments?: unknown;
+  flags?: unknown;
+}
+// Presentation-only flags the sandbox may pass through. Path-bearing flags
+// (--content-file/--file(s)/--image(s)), routing flags (--chat-id/--into/
+// --top-level), and --session-id are NOT allowlisted: content/attachments come
+// from validated outbox files, and session-id is forced by the worker.
+const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice']);
+const RELAY_FLAGS_VAL = new Set(['--mention', '--quote']);
+
+/**
+ * Validate an outbox relay request and build the argv for a host-side `send`,
+ * or reject it. PURE + exported for testing. Security guarantees:
+ *  - contentFile/attachments must be plain basenames whose realpath sits
+ *    directly inside `outbox` (defends against `../` and symlink-in-outbox
+ *    escapes — the sandbox can create symlinks in the bound outbox).
+ *  - only allowlisted presentation flags pass; any other flag → reject.
+ *  - --session-id is forced to the worker-supplied `sessionId`.
+ */
+export function buildRelayHostArgs(
+  req: RelayRequest,
+  outbox: string,
+  sessionId: string,
+): { ok: true; hostArgs: string[] } | { ok: false; error: string } {
+  let outboxReal: string;
+  try { outboxReal = realpathSync(outbox); } catch { outboxReal = outbox; }
+  const safe = (name: unknown): string | null => {
+    if (typeof name !== 'string' || !name || name.includes('/') || name.includes('\\') || name.includes('..')) return null;
+    const p = join(outbox, name);
+    if (!existsSync(p)) return null;
+    let real: string;
+    try { real = realpathSync(p); } catch { return null; }
+    if (real !== outboxReal && !real.startsWith(outboxReal + '/')) return null;  // escaped outbox
+    return p;
+  };
+
+  const contentPath = safe(req.contentFile);
+  if (!contentPath) return { ok: false, error: 'contentFile must be a file inside the outbox' };
+
+  const atts: string[] = [];
+  const rawAtts = Array.isArray(req.attachments) ? req.attachments : [];
+  for (const a of rawAtts) {
+    const ap = safe(a);
+    if (!ap) return { ok: false, error: 'attachment must be a file inside the outbox' };
+    atts.push(ap);
+  }
+
+  const flags: string[] = [];
+  const rawFlags = Array.isArray(req.flags) ? req.flags : [];
+  for (let i = 0; i < rawFlags.length; i++) {
+    const f = rawFlags[i];
+    if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
+    if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
+    if (RELAY_FLAGS_VAL.has(f)) {
+      const v = rawFlags[i + 1];
+      if (typeof v !== 'string') return { ok: false, error: `flag ${f} needs a string value` };
+      flags.push(f, v); i++; continue;
+    }
+    return { ok: false, error: `flag not allowed: ${f}` };  // incl. raw hostArgs / path flags
+  }
+
+  const hostArgs = [
+    ...flags,
+    '--content-file', contentPath,
+    ...atts.flatMap(a => ['--files', a]),
+    '--session-id', sessionId,  // forced — sandbox cannot target another session
+  ];
+  return { ok: true, hostArgs };
+}
+
 /**
  * Daemon/worker-side outbox watcher. The sandboxed `botmux send` (relay mode)
- * drops `<id>.req.json` here; we re-exec THIS build's `send` OUTSIDE the sandbox
- * (full env + creds + bots.json), capture the result, and write `<id>.res.json`
- * back. This is what keeps every Lark credential out of the sandbox.
+ * drops `<id>.req.json` here; we VALIDATE it (buildRelayHostArgs) and re-exec
+ * THIS build's `send` OUTSIDE the sandbox (full env + creds + bots.json), then
+ * write `<id>.res.json` back. Validation is what keeps creds out of the sandbox:
+ * the sandbox can only send outbox-resident files to its own session.
  *
  * `baseEnv` is the worker's env (has creds); we strip BOTMUX_SEND_RELAY so the
- * re-exec delivers directly instead of relaying to itself.
+ * re-exec delivers directly. `sessionId` is forced onto every relayed send.
  */
-export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv): () => void {
+export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv, sessionId: string): () => void {
   const cli = distCliJs();
   const env = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
   const inFlight = new Set<string>();
+
+  const finish = (id: string, reqPath: string, name: string, code: number, stdout: string, stderr: string) => {
+    try { writeFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
+    try { rmSync(reqPath, { force: true }); } catch { /* */ }
+    inFlight.delete(name);
+  };
 
   const tick = () => {
     let entries: string[] = [];
@@ -273,21 +361,18 @@ export function startOutboxWatcher(outbox: string, baseEnv: NodeJS.ProcessEnv): 
       inFlight.add(name);
       const reqPath = join(outbox, name);
       const id = name.slice(0, -'.req.json'.length);
-      let req: { hostArgs: string[] };
+      let req: RelayRequest;
       try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
-      catch { try { rmSync(reqPath, { force: true }); } catch { /* */ } inFlight.delete(name); continue; }
+      catch { finish(id, reqPath, name, 1, '', 'relay: bad json'); continue; }
 
-      const child = spawn(process.execPath, [cli, 'send', ...req.hostArgs], { env });
+      const built = buildRelayHostArgs(req, outbox, sessionId);
+      if (!built.ok) { finish(id, reqPath, name, 1, '', `relay rejected: ${built.error}`); continue; }
+
+      const child = spawn(process.execPath, [cli, 'send', ...built.hostArgs], { env });
       let out = '', err = '';
       child.stdout.on('data', d => { out += d; });
       child.stderr.on('data', d => { err += d; });
-      child.on('close', (code) => {
-        try {
-          writeFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code: code ?? 1, stdout: out, stderr: err }));
-        } catch { /* */ }
-        try { rmSync(reqPath, { force: true }); } catch { /* */ }
-        inFlight.delete(name);
-      });
+      child.on('close', (code) => finish(id, reqPath, name, code ?? 1, out, err));
     }
   };
 
