@@ -7,7 +7,8 @@
 
 ## 启用
 
-- per-bot：`bots.json` 里给该 bot 加 `"sandbox": true`
+- **dashboard（推荐）**：bot 默认设置面板（「默认进入 oncall 模式」那块）里的「**文件沙盒**」开关，一键开关、即时落 `bots.json`、下个新会话生效。配 oncall bot 时顺手勾上。
+- per-bot 手动：`bots.json` 里给该 bot 加 `"sandbox": true`
 - 临时/测试：环境变量 `BOTMUX_SANDBOX=1`（对该 daemon 的所有会话强制开）
 
 仅 Linux 生效（依赖 bubblewrap）；非 Linux 自动跳过。需要 PTY 后端（tmux/zellij 后端暂不包裹，自动回退直跑）。macOS 的 `sandbox-exec` 后端是后续工作。
