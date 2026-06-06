@@ -20,7 +20,7 @@
  */
 import { execSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -2816,7 +2816,76 @@ import { resolveBrandLabel } from './bot-registry.js';
 import { config } from './config.js';
 import { resolveQuoteTarget, validateMentionDecision } from './services/send-policy.js';
 
+/**
+ * Sandbox relay mode for `botmux send`. Inside a file-sandbox the CLI cannot
+ * read bots.json or reach Lark directly (creds are deliberately absent), so we
+ * hand the send to the daemon-side outbox watcher (adapters/backend/sandbox.ts
+ * startOutboxWatcher), which re-runs `send` OUTSIDE the sandbox with the
+ * worker's creds. Forward the argv verbatim (content via a file in the shared
+ * outbox), then block on the response file and mirror its result.
+ */
+async function relaySend(rest: string[], relayDir: string): Promise<void> {
+  const sid = argValue(rest, '--session-id') ?? process.env.BOTMUX_SESSION_ID;
+  if (!sid) { console.error('relay: 无法确定 session-id'); process.exit(1); }
+  // Resolve content with the same precedence as cmdSend (content-file > positional > stdin)
+  const contentFile = argValue(rest, '--content-file');
+  let content = '';
+  if (contentFile) {
+    content = existsSync(contentFile) ? readFileSync(contentFile, 'utf-8') : '';
+  } else {
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice']);
+    content = pos.length > 0 ? pos.join(' ') : await readStdin();
+  }
+  const id = randomBytes(8).toString('hex');
+  const cfile = join(relayDir, `${id}.content`);
+  writeFileSync(cfile, content);
+  // Forward flags verbatim, but: replace any --content-file with our shared
+  // one, pin --session-id (ancestor-pid inference doesn't cross the sandbox),
+  // and copy any --image/--file attachment into the shared outbox + rewrite its
+  // path (the in-sandbox path won't resolve on the host side, which delivers).
+  const FILE_FLAGS = new Set(['--image', '--images', '--file', '--files']);
+  const copyIntoOutbox = (p: string): string => {
+    if (!p || !existsSync(p)) return p;  // let the host side surface a clear error
+    const dst = join(relayDir, `${id}-${randomBytes(4).toString('hex')}-${basename(p)}`);
+    try { writeFileSync(dst, readFileSync(p)); return dst; } catch { return p; }
+  };
+  const hostArgs: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const tok = rest[i];
+    if (tok === '--content-file') { i++; continue; }
+    if (tok === '--session-id') { i++; continue; }
+    if (FILE_FLAGS.has(tok) && i + 1 < rest.length) { hostArgs.push(tok, copyIntoOutbox(rest[++i])); continue; }
+    const eqFlag = [...FILE_FLAGS].find(f => tok.startsWith(f + '='));
+    if (eqFlag) { hostArgs.push(`${eqFlag}=${copyIntoOutbox(tok.slice(eqFlag.length + 1))}`); continue; }
+    hostArgs.push(tok);
+  }
+  hostArgs.push('--content-file', cfile, '--session-id', sid);
+  writeFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({ hostArgs }));
+
+  const resPath = join(relayDir, `${id}.res.json`);
+  const deadlineMs = Date.now() + 120_000;
+  while (Date.now() < deadlineMs) {
+    if (existsSync(resPath)) {
+      try {
+        const res = JSON.parse(readFileSync(resPath, 'utf-8')) as { code?: number; stdout?: string; stderr?: string };
+        try { unlinkSync(resPath); } catch { /* */ }
+        try { unlinkSync(cfile); } catch { /* */ }
+        if (res.stdout) process.stdout.write(res.stdout);
+        if (res.stderr) process.stderr.write(res.stderr);
+        process.exit(res.code ?? 0);
+      } catch { /* partial write — retry next tick */ }
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+  console.error('relay: 等待 daemon 投递超时（120s）');
+  process.exit(1);
+}
+
 async function cmdSend(rest: string[]): Promise<void> {
+  // Sandbox relay: a file-sandboxed session has no creds/bots.json, so route
+  // the send through the daemon-side outbox instead of delivering directly.
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  if (relayDir) { await relaySend(rest, relayDir); return; }
   // Safety gate: a CLI agent running inside a workflow subagent (Slice F)
   // must not chat-post directly — chat-facing side effects are reserved
   // for `hostExecutor` activities so they can be tracked via

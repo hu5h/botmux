@@ -1317,6 +1317,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliPathOverride: botCfg.cliPathOverride,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    sandbox: botCfg.sandbox === true,
     backendType: botCfg.backendType ?? config.daemon.backendType,
     prompt,
     resume,

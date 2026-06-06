@@ -64,6 +64,7 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend } from './adapters/backend/session-backend-selector.js';
+import { prepareSandbox, startOutboxWatcher, sandboxEnabled } from './adapters/backend/sandbox.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { IdleDetector } from './utils/idle-detector.js';
@@ -86,6 +87,7 @@ import { createHash } from 'node:crypto';
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
 let cliPidMarker: string | null = null;  // path to .botmux-cli-pids/<pid>
+let sandboxStopWatcher: (() => void) | null = null;  // stop fn for the sandbox outbox watcher
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** Adopt-bridge mode using TmuxPipeBackend: not a tmux attach client, all
@@ -3318,8 +3320,39 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // them past the server's global env.
   if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
 
-  backend.spawn(cliAdapter.resolvedBin, args, {
-    cwd: cfg.workingDir,
+  // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
+  // per-session project copy + de-identified config. The agent's `botmux send`
+  // routes through a daemon-side outbox watcher (creds never enter the sandbox).
+  // PTY backend only for the spike; falls back to direct spawn on any failure.
+  let spawnBin = cliAdapter.resolvedBin;
+  let spawnArgs = args;
+  let spawnCwd = cfg.workingDir;
+  if ((cfg.sandbox || sandboxEnabled()) && effectiveBackendType === 'pty' && process.env.SESSION_DATA_DIR) {
+    try {
+      const sbx = prepareSandbox({
+        cliId: cfg.cliId,
+        sessionId: cfg.sessionId,
+        sourceWorkingDir: cfg.workingDir,
+        dataDir: process.env.SESSION_DATA_DIR,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+      });
+      if (sbx) {
+        spawnBin = sbx.bin;
+        spawnArgs = sbx.args;
+        spawnCwd = sbx.workDir;
+        Object.assign(childEnv, sbx.env);
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv);
+        log(`Sandbox ON (${cfg.cliId}): work=${sbx.workDir} outbox=${sbx.outbox}`);
+      }
+    } catch (err: any) {
+      log(`Sandbox prepare failed (${err.message}) — falling back to direct spawn`);
+    }
+  }
+
+  backend.spawn(spawnBin, spawnArgs, {
+    cwd: spawnCwd,
     cols: PTY_COLS,
     rows: PTY_ROWS,
     env: childEnv as Record<string, string>,
@@ -3529,6 +3562,12 @@ function killCli(): void {
   if (cliPidMarker) {
     try { unlinkSync(cliPidMarker); } catch { /* already gone */ }
     cliPidMarker = null;
+  }
+  // Stop the sandbox outbox watcher (the per-session sandbox tree is left in
+  // place so a same-topic resume reuses the same clone + scoped config).
+  if (sandboxStopWatcher) {
+    try { sandboxStopWatcher(); } catch { /* */ }
+    sandboxStopWatcher = null;
   }
   isPromptReady = false;
   pendingMessages.length = 0;
