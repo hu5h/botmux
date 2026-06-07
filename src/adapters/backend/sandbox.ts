@@ -75,10 +75,16 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   return a;
 }
 
-/** Per-CLI config-dir scoping: which `~/<subdir>` to recreate, and which files
- *  to SEED (auth/config). Everything not listed is scrubbed — history, session
- *  transcripts, logs, other-project data all stay out of the sandbox. */
-interface ConfigScope { subdir: string; seed: readonly string[]; }
+/** Per-CLI config-dir scoping for `~/<subdir>`. Two modes:
+ *   - `seed`  (allowlist): copy ONLY these entries — safest, for CLIs whose
+ *     minimal auth set is known (codex).
+ *   - `scrub` (blocklist): copy the WHOLE dir EXCEPT these entries — robust for
+ *     CLIs that need their full config to run (claude needs settings.json's env
+ *     proxy block, settings.local.json, MCP config, …; coco needs its plugins).
+ *     Only the cross-session-history items are excluded.
+ *  `claudeTrust` additionally writes a minimal `~/.claude.json` trusting only the
+ *  current project (the host's 69-project list is dropped). */
+interface ConfigScope { subdir: string; seed?: readonly string[]; scrub?: readonly string[]; claudeTrust?: boolean; }
 
 const CONFIG_SCOPE: Record<string, ConfigScope> = {
   // codex: seed auth + config only. history.jsonl / sessions / logs_2.sqlite /
@@ -92,12 +98,21 @@ const CONFIG_SCOPE: Record<string, ConfigScope> = {
     subdir: '.codex',
     seed: ['auth.json', 'config.toml', 'config.toml.old', 'config.toml.current', 'hooks.json', 'installation_id'],
   },
-  // claude family: seed credentials + settings; projects/ (per-project history)
-  // and todos/ stay out. (.claude.json folder-trust lives beside ~/.claude and
-  // is handled by the caller when needed.)
+  // claude: ALLOWLIST (default-deny) — ~/.claude has many session/privacy dirs
+  // (history.jsonl, projects/, file-history/, paste-cache/, plans/, tasks/,
+  // downloads/, debug/ …) that must NOT enter the sandbox, so we copy only the
+  // config/auth files. settings.json is critical: its `env` block carries
+  // http_proxy/https_proxy — without it claude can't reach the API. + folder-trust.
   'claude-code': {
     subdir: '.claude',
-    seed: ['.credentials.json', 'settings.json'],
+    seed: ['.credentials.json', 'settings.json', 'settings.local.json', 'mcp-needs-auth-cache.json'],
+    claudeTrust: true,
+  },
+  // coco (Rust): copy ~/.cache/coco EXCEPT history/sessions/logs; keep plugins/
+  // (its API config). coco recreates history/sessions fresh inside the sandbox.
+  coco: {
+    subdir: '.cache/coco',
+    scrub: ['history.jsonl', 'sessions', 'log', 'crashmarks', 'event-queue'],
   },
 };
 
@@ -109,22 +124,46 @@ const CONFIG_SCOPE: Record<string, ConfigScope> = {
  *
  * Returns false if this CLI has no persistent config to scope (hermes/aiden/…).
  */
-export function seedScopedConfig(cliId: string, scopedHome: string): boolean {
+export function seedScopedConfig(cliId: string, scopedHome: string, projectMount?: string): boolean {
   const scope = CONFIG_SCOPE[cliId];
   if (!scope) return false;
   const hostRoot = join(homedir(), scope.subdir);
   const dstRoot = join(scopedHome, scope.subdir);
   mkdirSync(dstRoot, { recursive: true });
-  for (const f of scope.seed) {
-    const src = join(hostRoot, f);
-    if (!existsSync(src)) continue;
-    try {
-      cpSync(src, join(dstRoot, f), { recursive: true, dereference: true });
-    } catch {
-      /* best-effort: a missing/locked config file shouldn't block the sandbox */
-    }
+
+  const copy = (name: string) => {
+    const src = join(hostRoot, name);
+    if (!existsSync(src)) return;
+    try { cpSync(src, join(dstRoot, name), { recursive: true, dereference: true }); }
+    catch { /* best-effort: a missing/locked entry shouldn't block the sandbox */ }
+  };
+
+  if (scope.seed) {
+    for (const f of scope.seed) copy(f);
+  } else if (scope.scrub) {
+    const skip = new Set<string>(scope.scrub);
+    let entries: string[] = [];
+    try { entries = readdirSync(hostRoot); } catch { /* host config absent */ }
+    for (const name of entries) if (!skip.has(name)) copy(name);
   }
+
+  if (scope.claudeTrust && projectMount) seedClaudeTrust(scopedHome, projectMount);
   return true;
+}
+
+/** Write a minimal `<scopedHome>/.claude.json` that pre-accepts folder-trust for
+ *  ONLY `projectMount`. We start from the host file (to keep claude's onboarding/
+ *  account state so it doesn't re-run first-run) but REPLACE its `projects` map
+ *  so the host's full project list never enters the sandbox. */
+function seedClaudeTrust(scopedHome: string, projectMount: string): void {
+  const hostJson = join(homedir(), '.claude.json');
+  let data: any = {};
+  if (existsSync(hostJson)) {
+    try { data = JSON.parse(readFileSync(hostJson, 'utf8')); } catch { data = {}; }
+  }
+  if (!data || typeof data !== 'object') data = {};
+  data.projects = { [projectMount]: { hasTrustDialogAccepted: true } };  // drop host's project list
+  try { writeFileSync(join(scopedHome, '.claude.json'), JSON.stringify(data)); } catch { /* */ }
 }
 
 // ───────────────────────────── orchestration ─────────────────────────────
@@ -205,8 +244,9 @@ export function prepareSandbox(opts: {
   const src = process.env.BOTMUX_SANDBOX_SRC || opts.sourceWorkingDir;
   if (!existsSync(workDir)) cloneProject(src, workDir);
 
-  // De-identified CLI config (auth only, history scrubbed).
-  seedScopedConfig(opts.cliId, scopedHome);
+  // De-identified CLI config (auth + settings/proxy-env; cross-session history
+  // scrubbed). projectMount lets claude-family pre-accept folder-trust for it.
+  seedScopedConfig(opts.cliId, scopedHome, opts.sourceWorkingDir);
 
   // `botmux` shim → THIS build's cli.js, so in-sandbox `botmux send` hits relay
   // mode (and never the host's shared dist / bots.json).
@@ -228,6 +268,12 @@ export function prepareSandbox(opts: {
     const real = realpathSync(join(pkgRoot, 'node_modules'));
     if (real !== join(pkgRoot, 'node_modules')) toolchainRo.push(real);
   } catch { /* no node_modules symlink to chase */ }
+  // The CLI binary's own dir + its symlink-resolved dir. Critical: claude/coco
+  // live in ~/.local/bin (under the masked home), so without this they're not
+  // found inside the sandbox and exec fails. (codex happened to be under the
+  // fnm install above; not all CLIs are.)
+  toolchainRo.push(dirname(opts.cliBin));
+  try { toolchainRo.push(dirname(realpathSync(opts.cliBin))); } catch { /* */ }
 
   // Mount target = the original workingDir the CLI was told about (NOT the
   // clone source, which BOTMUX_SANDBOX_SRC may override). codex's `-C <dir>` etc.
@@ -236,6 +282,11 @@ export function prepareSandbox(opts: {
   const args = buildSandboxArgs(plan);
   // Mount the shim bin at a fixed, host-absent path and prepend it to PATH.
   args.push('--ro-bind', shimBin, '/sbxbin');
+  // botmux skill/plugin dir (claude `--plugin-dir` points here; carries the
+  // botmux-send etc. skills, no secrets). Re-exposed read-only on top of the
+  // masked ~/.botmux so the agent's skills load (but bots.json stays hidden).
+  const pluginDir = join(home, '.botmux', 'claude-plugin');
+  if (existsSync(pluginDir)) args.push('--ro-bind-try', pluginDir, pluginDir);
   args.push('--', opts.cliBin, ...opts.cliArgs);
 
   const env: Record<string, string> = {
