@@ -15,6 +15,8 @@ const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
+const OMP_ACTIVE_BUSY_PATTERN =
+  /(?:Working(?:\.\.\.|…)|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+\d+(?:\.\d+)?(?:ms|s|m|h)\s*│[^\r\n]{0,240}%┃|●\s+🐴\s+ponytail:)/i;
 
 export function ompSessionDir(sessionId: string): string {
   if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
@@ -216,8 +218,11 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
+    // OMP can stay silent during a long tool call; its active footer is the
+    // positive edge that keeps direct tmux input from remaining falsely idle.
+    busyPattern: OMP_ACTIVE_BUSY_PATTERN,
+    idleToBusyPattern: OMP_ACTIVE_BUSY_PATTERN,
     readyPattern: undefined,
-    busyPattern: /Working(?:\.\.\.|…)/,
     supportsTypeAhead: true,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,

@@ -2361,6 +2361,17 @@ describe('idleToBusyPattern', () => {
     expect(adapter.idleToBusyPattern!.test('Working… on the fix')).toBe(false);
   });
 
+  it('oh-my-pi distinguishes the active footer from the idle composer footer', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const busy = adapter.idleToBusyPattern;
+    expect(adapter.busyPattern).toBeDefined();
+    expect(busy).toBeDefined();
+    expect(busy!.test('⠇ 1h │ ⬢ GPT-5.6-Sol · ◕ xhigh │ 📁 …ance ────────67%┃─272K─')).toBe(true);
+    expect(busy!.test('● 🐴 ponytail: ⚡ FULL')).toBe(true);
+    expect(busy!.test('π │ ⬢ GPT-5.6-Sol · ◕ xhigh │ 📁 …/codes/botmux-clients')).toBe(false);
+    expect(busy!.test('○ 🐴 ponytail: ⚡ FULL')).toBe(false);
+  });
+
   it.each([
     ['genius', createGeniusAdapter('/bin/genius')],
     ['grok', createGrokAdapter('/bin/grok')],

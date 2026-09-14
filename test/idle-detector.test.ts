@@ -13,6 +13,7 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
@@ -133,6 +134,21 @@ describe('IdleDetector: onBusy()', () => {
     detector.fireIdle();
     detector.feed('• Working (1s • esc to interrupt)');
     expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('revives an idle oh-my-pi cycle only when the active footer appears', () => {
+    const detector = new IdleDetector(createOhMyPiAdapter('/bin/omp'));
+    const cb = vi.fn();
+    detector.onBusy(cb);
+
+    detector.fireIdle();
+    detector.feed('π │ ⬢ GPT-5.6-Sol · ◕ xhigh │ 📁 …/codes/botmux\n○ 🐴 ponytail: ⚡ FULL');
+    expect(cb).not.toHaveBeenCalled();
+
+    detector.feed('⠇ 1h │ ⬢ GPT-5.6-Sol · ◕ xhigh │ 📁 …ance ────────67%┃─272K─');
+    detector.feed('● 🐴 ponytail: ⚡ FULL');
+    expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
 
